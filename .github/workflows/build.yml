@@ -6,7 +6,9 @@ name: Build
 
 on:
   push:
-    branches: [main]
+    # main, and lane branches before they land (a workflow on a branch cannot be
+    # started by hand until it is on main).
+    branches: [main, "ci/**"]
   pull_request:
   workflow_dispatch:
 
