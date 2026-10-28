@@ -1,0 +1,535 @@
+package org.pocketworkstation.pckeyboard
+
+import android.content.Context
+import android.view.LayoutInflater
+import android.view.KeyEvent
+import android.view.inputmethod.InputConnection
+
+/**
+ * droidtop's persistent second-screen keyboard (docs/SPEC.md sections 4,
+ * 6 and 6c).
+ *
+ * ## What Android actually permits, stated before the design
+ *
+ * An IME's window is placed by the PLATFORM, not by the IME. Android picks
+ * the display from `WindowManager#getDisplayImePolicy()` for the display
+ * the focused app is on, and the only choices are "the focused app's
+ * display", "the default display" and "nowhere"; setting that policy needs
+ * a system permission, and the platform additionally refuses to show an
+ * IME on displays it does not itself own. There is no arrangement of
+ * layouts, window flags or tokens by which an ordinary app puts its IME
+ * window on the second screen and leaves it there. Nor is "persistent" an
+ * IME concept at all: the soft input window is shown when an editor asks
+ * for it and hidden when one stops.
+ *
+ * So a persistent second-screen keyboard cannot be an IME window, and
+ * anything built as though it could be would silently do nothing.
+ *
+ * ## What it is instead
+ *
+ * An ORDINARY droidtop window on the second screen, containing a real
+ * [LatinKeyboardView] -- the fork's own key grid, its own themes, its own
+ * `kbd_full` layout with the function row, Ctrl, Alt, Esc and the arrow
+ * cluster. That view is the reason Hacker's Keyboard was forked in rather
+ * than a keyboard being drawn from scratch, and it is used here unmodified.
+ *
+ * What changes is where the keystrokes go, and the model for both
+ * destinations is the same one: a HARDWARE keyboard. Keys are pressed and
+ * released; the far side decides what they produce.
+ *
+ * - **Into a container** (Desktop mode): each key becomes an Android
+ *   keycode handed to `:input-seat`'s existing `DesktopInputRouter`, which
+ *   already knows how to turn one into an evdev key. The compositor's XKB
+ *   keymap applies the layout and its own auto-repeat, exactly as it does
+ *   for a lapdock's physical keyboard.
+ * - **Into an Android app** (Gaming and Standard modes): each key
+ *   becomes an `InputConnection.sendKeyEvent`, which is precisely the call
+ *   whose contract is "as though a hardware key was pressed". The IME
+ *   records the connection in `onStartInput`; this input-session callback
+ *   is independent of Android showing its soft-input view. It needs
+ *   droidtop's IME selected and an editor focused, and the surface reports
+ *   when either condition is missing.
+ *
+ * Both routes share one translation ([HackersKeyCodes]) and one key table
+ * (`EvdevKeys`, on the container side only). Nothing here reimplements the
+ * IME or drives its view internals. The service exposes only the active
+ * editor connection captured at input start, which remains usable when
+ * Android does not draw its soft-input window.
+ *
+ * ## What is given up, stated rather than hidden
+ *
+ * The hardware-key model means no autocorrect, no suggestion strip, no
+ * dead-key composition and no shift-state relabelling of the keys on this
+ * surface. For a keyboard whose entire purpose is driving a terminal, Wine
+ * and a desktop (section 6a), those are the right things to lose; a user
+ * who wants them still has the ordinary on-primary keyboard, by turning
+ * this surface off.
+ */
+object SecondScreenKeyboard {
+
+    @Volatile
+    private var activeInputConnection: InputConnection? = null
+
+    @Volatile
+    private var activeInputType: Int = 0
+
+    /**
+     * Called by LatinIME's input lifecycle, which is independent of its window lifecycle. [inputType] is the
+     * editor's `EditorInfo.inputType`, kept so what is typed from another device can be masked for a password.
+     */
+    @JvmStatic
+    @JvmOverloads
+    fun onStartInput(connection: InputConnection?, inputType: Int = 0) {
+        activeInputConnection = connection
+        activeInputType = inputType
+    }
+
+    @JvmStatic
+    fun onFinishInput() {
+        activeInputConnection = null
+        activeInputType = 0
+        onShowEnded()
+    }
+
+    /**
+     * Told when an editor asks droidtop's input method for its keyboard and when that ends, so `:app` can draw
+     * the keyboard itself on a screen where Android places no keyboard window (docs/SPEC.md 4c, "Typing on the
+     * add-on display"). [ShowRequests.requested] names the editor's package; `EditorInfo` carries no display.
+     */
+    interface ShowRequests {
+        fun requested(editorPackage: String?)
+
+        fun ended()
+
+        /** The editor asked again while its keyboard may be hidden by the user's Hide (a second tap on the field). */
+        fun reasked() = Unit
+    }
+
+    @Volatile
+    var showRequests: ShowRequests? = null
+
+    /** LatinIME.onStartInputView: an editor asked for the keyboard. */
+    @JvmStatic
+    fun onShowRequested(editorPackage: String?) {
+        runCatching { showRequests?.requested(editorPackage) }
+    }
+
+    /** LatinIME.onShowInputRequested: the app asked for the keyboard again (a tap on the focused field). */
+    @JvmStatic
+    fun onShowReasked() {
+        runCatching { showRequests?.reasked() }
+    }
+
+    /** LatinIME.onFinishInputView and onFinishInput: the keyboard is no longer wanted. */
+    @JvmStatic
+    fun onShowEnded() {
+        runCatching { showRequests?.ended() }
+    }
+
+    /**
+     * How many second-screen keyboard surfaces are up.
+     *
+     * Counted rather than a flag, because there can legitimately be two at
+     * once: the idle `SECONDARY_HOME` activity the platform places, and
+     * the live `Presentation` the foreground shell owns above it (the
+     * split docs/SPEC.md section 4c exists to explain). With a flag, the
+     * first of them to go away would tell the IME the second screen was
+     * free and the on-primary keyboard would come back underneath a
+     * keyboard that is still on screen.
+     */
+    @Volatile
+    private var attachCount: Int = 0
+
+    /**
+     * True while any second-screen keyboard surface is up. Read from Java
+     * as `SecondScreenKeyboard.INSTANCE.getAttached()`.
+     *
+     * [LatinIME.onEvaluateInputViewShown] reads it, which is the platform's
+     * own mechanism for "there is a real keyboard elsewhere, do not cover
+     * the screen with a soft one" -- the same answer it gives when a
+     * hardware keyboard is attached, which is materially what the user has
+     * arranged. Suppressing the on-primary keyboard is the entire point of
+     * putting one on the second screen; without this the user gets both.
+     */
+    val attached: Boolean get() = attachCount > 0
+
+    @Synchronized
+    fun setAttached(value: Boolean) {
+        val before = attachCount > 0
+        attachCount = if (value) attachCount + 1 else (attachCount - 1).coerceAtLeast(0)
+        if (before == (attachCount > 0)) return
+        // The IME re-evaluates only when asked; without this the change
+        // takes effect at the next focus event rather than immediately.
+        LatinIME.sInstance?.let { ime -> runCatching { ime.updateInputViewShown() } }
+    }
+
+    /**
+     * Whether droidtop's own IME is running at all -- which it only is
+     * when the user has selected it, because an unselected input method is
+     * never bound.
+     *
+     * Exposed here rather than by widening `LatinIME.sInstance`, which is
+     * package-private in the forked upstream source and should stay that
+     * way: `:app` needs the answer, not the field.
+     */
+    val imeRunning: Boolean get() = LatinIME.sInstance != null
+
+    /**
+     * Where the Android route types, or null when there is nowhere. Both
+     * ways of being null are real preconditions: an IME that is installed
+     * but not selected is never bound, and a bound IME with no focused
+     * editor has no `InputConnection`. Captured from `onStartInput`, not
+     * inferred from the IME window being visible.
+     */
+    val androidTarget: InputConnection? get() = activeInputConnection
+
+    /** The focused editor's `EditorInfo.inputType`; 0 when there is none. */
+    val androidInputType: Int get() = activeInputType
+
+    /** Whether the Android route currently has anywhere to type. */
+    fun androidTargetAvailable(): Boolean = androidTarget != null
+
+    /**
+     * A real [LatinKeyboardView], inflated from the fork's own themed
+     * layout.
+     *
+     * [context] must be a context for the display the keyboard will appear
+     * on (a `Presentation`'s own context, or one from
+     * `createDisplayContext`): [Keyboard] sizes itself from
+     * `resources.displayMetrics`, so a context for the wrong display lays
+     * the keyboard out for the wrong panel.
+     */
+    fun createView(
+        context: Context,
+        listener: LatinKeyboardBaseView.OnKeyboardActionListener,
+        heightPercent: Float = DEFAULT_HEIGHT_PERCENT,
+    ): LatinKeyboardView {
+        val view = LayoutInflater.from(context)
+            .inflate(R.layout.input_material_dark, null) as LatinKeyboardView
+        applyLayout(view, context, functionLayer = false, heightPercent = heightPercent)
+        view.setOnKeyboardActionListener(listener)
+        // No key-preview bubbles: they pop ABOVE the touched key, so the
+        // top row's would be clipped by the display edge, and a keyboard
+        // that is permanently present should not flash what was pressed.
+        view.setPreviewEnabled(false)
+        view.setPadding(0, 0, 0, 0)
+        return view
+    }
+
+    /**
+     * Swaps between the fork's full layout and its Fn layer -- the fork's
+     * own `kbd_full` and `kbd_full_fn` resources, which is where its
+     * symbols and secondary keys live. Driven by the Fn and layout-switch
+     * keys, which otherwise would do nothing at all on this surface,
+     * because the [LatinIME] that normally handles them is not in the loop.
+     */
+    fun applyLayout(
+        view: LatinKeyboardView,
+        context: Context,
+        functionLayer: Boolean,
+        heightPercent: Float = DEFAULT_HEIGHT_PERCENT,
+    ) {
+        val xml = if (functionLayer) R.xml.kbd_full_fn else R.xml.kbd_full
+        val mode = if (functionLayer) {
+            KeyboardSwitcher.KEYBOARDMODE_SYMBOLS
+        } else {
+            KeyboardSwitcher.KEYBOARDMODE_NORMAL
+        }
+        view.setKeyboard(LatinKeyboard(context, xml, mode, heightPercent))
+    }
+
+    /**
+     * Share of the second screen the keyboard occupies, leaving the rest
+     * for the trackpad. The addon panel is 1080x1920 used in portrait
+     * below the main screen, so a little under half of it is a usable key
+     * grid with a usable trackpad beneath.
+     */
+    const val DEFAULT_HEIGHT_PERCENT = 45f
+}
+
+/** A one-shot delay on the main thread, for [SecondScreenKeyboardListener]'s held space bar. */
+interface HoldTimer {
+    fun start(delayMs: Long, action: () -> Unit)
+
+    fun cancel()
+}
+
+/**
+ * Repeats a held key for a destination that does not (see [KeyboardSink.repeatsAtSource]): [action] runs after
+ * [delayMs], then every [intervalMs] until [cancel].
+ */
+interface RepeatTimer {
+    fun start(delayMs: Long, intervalMs: Long, action: () -> Unit)
+
+    fun cancel()
+}
+
+/**
+ * Turns Hacker's Keyboard key events into hardware-style key press and
+ * release pairs.
+ *
+ * Deliberately driven by `onPress`/`onRelease` rather than `onKey`: both
+ * destinations want a physical key model, where a key is held down and the
+ * far side owns layout and auto-repeat. `onKey` is the character-oriented
+ * callback and would make droidtop decide those things a second time.
+ *
+ * Modifiers latch, because a touch keyboard cannot expect a user to hold
+ * Ctrl with one hand and press C with the other on a screen they are also
+ * using as a trackpad. Tapping Ctrl holds it; the next ordinary key
+ * releases it; tapping it again lets it go. That is Hacker's Keyboard's
+ * own sticky-modifier behaviour, kept rather than replaced.
+ */
+class SecondScreenKeyboardListener(
+    /** [down] false is a release. Keycodes are Android's. */
+    private val send: (androidKeyCode: Int, down: Boolean) -> Unit,
+    private val resolver: CharKeyResolver,
+    /**
+     * Text that no key can produce -- an emoji from a popup, an accented
+     * character. Null for a destination that has no text channel, which is
+     * the container: a compositor takes keys, not strings, and inventing
+     * one would mean inventing a layout.
+     */
+    private val commit: ((CharSequence) -> Unit)? = null,
+    /** Fn / layout-switch, which change what THIS keyboard shows and go nowhere else. */
+    private val onLayoutToggle: () -> Unit = {},
+    /**
+     * Space-bar drag moves the cursor (Droidtop/tracker#340). A hardware key is typed the moment it goes down, so
+     * with this on the space bar goes down and up together when it is let go, unless the touch became a drag.
+     */
+    private val deferSpace: Boolean = false,
+    /** With [deferSpace]: presses a held space bar after [SPACE_HOLD_MS], so it repeats at the far side. */
+    private val holdTimer: HoldTimer? = null,
+    /**
+     * Repeats Backspace, Delete, the arrows and Page Up and Down while one is held, for a destination whose far side
+     * sees only the one key-down; null where the far side repeats by itself (a compositor).
+     */
+    private val repeatTimer: RepeatTimer? = null,
+) : LatinKeyboardBaseView.OnKeyboardActionListener {
+
+    private val latchedModifiers = LinkedHashSet<Int>()
+    private var repeatingKey: Int? = null
+    private var spacePending = false
+    private var spaceCancelled = false
+    private var spaceDown = false
+    private val heldKeys = HashMap<Int, KeyStroke>()
+    private var transientShift = false
+
+    override fun onPress(primaryCode: Int) {
+        if (primaryCode in LAYOUT_KEYS) {
+            onLayoutToggle()
+            return
+        }
+
+        if (KeyboardCapture.offerKey(primaryCode)) return
+
+        if (deferSpace && primaryCode == SPACE) {
+            spacePending = true
+            spaceCancelled = false
+            spaceDown = false
+            holdTimer?.start(SPACE_HOLD_MS) { pressHeldSpace() }
+            return
+        }
+
+        val stroke = strokeFor(primaryCode)
+        if (stroke == null) {
+            // A printable character with no key that produces it (an
+            // emoji, an accent). Committed as text where there is a text
+            // channel, dropped where there is not.
+            if (HackersKeyCodes.isPrintable(primaryCode)) {
+                commit?.invoke(primaryCode.toChar().toString())
+            }
+            return
+        }
+
+        if (stroke.androidKeyCode in MODIFIERS) {
+            if (latchedModifiers.remove(stroke.androidKeyCode)) {
+                send(stroke.androidKeyCode, false)
+            } else {
+                latchedModifiers += stroke.androidKeyCode
+                send(stroke.androidKeyCode, true)
+            }
+            return
+        }
+
+        if (stroke.shift && KeyEvent.KEYCODE_SHIFT_LEFT !in latchedModifiers) {
+            transientShift = true
+            send(KeyEvent.KEYCODE_SHIFT_LEFT, true)
+        }
+        heldKeys[primaryCode] = stroke
+        send(stroke.androidKeyCode, true)
+        val timer = repeatTimer
+        if (timer != null && stroke.androidKeyCode in REPEATABLE) {
+            repeatingKey = stroke.androidKeyCode
+            timer.start(REPEAT_DELAY_MS, REPEAT_INTERVAL_MS) { send(stroke.androidKeyCode, true) }
+        }
+    }
+
+    override fun onRelease(primaryCode: Int) {
+        if (spacePending && primaryCode == SPACE) {
+            holdTimer?.cancel()
+            spacePending = false
+            val stroke = strokeFor(SPACE)
+            if (spaceDown) {
+                spaceDown = false
+                stroke?.let { send(it.androidKeyCode, false) }
+                releaseLatched()
+            } else if (!spaceCancelled) {
+                stroke?.let {
+                    send(it.androidKeyCode, true)
+                    send(it.androidKeyCode, false)
+                    releaseLatched()
+                }
+            }
+            return
+        }
+        val stroke = heldKeys.remove(primaryCode) ?: return
+        if (stroke.androidKeyCode == repeatingKey) stopRepeat()
+        send(stroke.androidKeyCode, false)
+        if (transientShift) {
+            transientShift = false
+            send(KeyEvent.KEYCODE_SHIFT_LEFT, false)
+        }
+        releaseLatched()
+    }
+
+    /**
+     * Nothing: `onPress`/`onRelease` already delivered the key. Auto-repeat
+     * arrives here as repeated `onKey` calls with no matching press, and is
+     * ignored on purpose -- the key is still held at the far side, which
+     * owns the repeat rate. `DesktopInputRouter` made the same call for
+     * physical keyboards, for the same reason.
+     */
+    override fun onKey(primaryCode: Int, keyCodes: IntArray?, x: Int, y: Int) = Unit
+
+    /** Popup keys and multi-character keys arrive whole rather than per key. */
+    override fun onText(text: CharSequence?) {
+        text ?: return
+        if (KeyboardCapture.offerText(text)) return
+        val commit = commit
+        if (commit != null) {
+            commit(text)
+            return
+        }
+        for (character in text) {
+            val stroke = resolver.resolve(character) ?: continue
+            if (stroke.shift) send(KeyEvent.KEYCODE_SHIFT_LEFT, true)
+            send(stroke.androidKeyCode, true)
+            send(stroke.androidKeyCode, false)
+            if (stroke.shift) send(KeyEvent.KEYCODE_SHIFT_LEFT, false)
+        }
+    }
+
+    /**
+     * A space-bar drag: each step is an arrow key, pressed and released. A Shift latched on the keyboard is held at
+     * the far side, so the arrow selects, as it does on a hardware keyboard.
+     */
+    override fun onCursorDrag(steps: Int) {
+        spaceCancelled = true
+        holdTimer?.cancel()
+        if (spaceDown) {
+            spaceDown = false
+            strokeFor(SPACE)?.let { send(it.androidKeyCode, false) }
+        }
+        val key = if (steps < 0) KeyEvent.KEYCODE_DPAD_LEFT else KeyEvent.KEYCODE_DPAD_RIGHT
+        repeat(kotlin.math.abs(steps)) {
+            send(key, true)
+            send(key, false)
+        }
+    }
+
+    override fun onCancel() = releaseEverything()
+
+    override fun swipeLeft(): Boolean = false
+    override fun swipeRight(): Boolean = false
+    override fun swipeDown(): Boolean = false
+    override fun swipeUp(): Boolean = false
+
+    /**
+     * Lets go of everything the far side thinks is held. Called when the
+     * surface goes away: a modifier whose release never arrives leaves the
+     * container behaving as though Ctrl were permanently down, which is
+     * the failure `DesktopInputRouter.releaseHeldInput` also exists for.
+     */
+    private fun pressHeldSpace() {
+        if (!spacePending || spaceCancelled || spaceDown) return
+        strokeFor(SPACE)?.let {
+            spaceDown = true
+            send(it.androidKeyCode, true)
+        }
+    }
+
+    private fun stopRepeat() {
+        repeatTimer?.cancel()
+        repeatingKey = null
+    }
+
+    fun releaseEverything() {
+        stopRepeat()
+        holdTimer?.cancel()
+        if (spaceDown) {
+            spaceDown = false
+            strokeFor(SPACE)?.let { send(it.androidKeyCode, false) }
+        }
+        spacePending = false
+        heldKeys.values.forEach { send(it.androidKeyCode, false) }
+        heldKeys.clear()
+        if (transientShift) {
+            transientShift = false
+            send(KeyEvent.KEYCODE_SHIFT_LEFT, false)
+        }
+        releaseLatched()
+    }
+
+    private fun releaseLatched() {
+        if (latchedModifiers.isEmpty()) return
+        latchedModifiers.forEach { send(it, false) }
+        latchedModifiers.clear()
+    }
+
+    private fun strokeFor(primaryCode: Int): KeyStroke? =
+        if (HackersKeyCodes.isPrintable(primaryCode)) {
+            resolver.resolve(primaryCode.toChar())
+        } else {
+            HackersKeyCodes.specialStroke(primaryCode)
+        }
+
+    private companion object {
+        /**
+         * `Keyboard.KEYCODE_MODE_CHANGE` and `LatinKeyboardView.KEYCODE_FN`,
+         * by value because both are package-private Java constants.
+         */
+        val LAYOUT_KEYS = setOf(-2, -119)
+
+        const val SPACE = 32
+
+        /** Hold-to-repeat, as a hardware keyboard's defaults: a pause, then about twenty a second. */
+        const val REPEAT_DELAY_MS = 400L
+        const val REPEAT_INTERVAL_MS = 50L
+
+        /** The keys that repeat when held. Letters do not: a long press on one is its popup. */
+        val REPEATABLE = setOf(
+            KeyEvent.KEYCODE_DEL,
+            KeyEvent.KEYCODE_FORWARD_DEL,
+            KeyEvent.KEYCODE_DPAD_UP,
+            KeyEvent.KEYCODE_DPAD_DOWN,
+            KeyEvent.KEYCODE_DPAD_LEFT,
+            KeyEvent.KEYCODE_DPAD_RIGHT,
+            KeyEvent.KEYCODE_PAGE_UP,
+            KeyEvent.KEYCODE_PAGE_DOWN,
+        )
+
+        /** A space bar held this long is a held key, not a tap that may still become a cursor drag. */
+        const val SPACE_HOLD_MS = 250L
+
+        val MODIFIERS = setOf(
+            KeyEvent.KEYCODE_SHIFT_LEFT,
+            KeyEvent.KEYCODE_SHIFT_RIGHT,
+            KeyEvent.KEYCODE_CTRL_LEFT,
+            KeyEvent.KEYCODE_CTRL_RIGHT,
+            KeyEvent.KEYCODE_ALT_LEFT,
+            KeyEvent.KEYCODE_ALT_RIGHT,
+            KeyEvent.KEYCODE_META_LEFT,
+            KeyEvent.KEYCODE_META_RIGHT,
+        )
+    }
+}
