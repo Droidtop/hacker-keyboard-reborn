@@ -1,0 +1,22 @@
+# The versions droidtop builds its keyboard module with (droidtop's gradle/libs.versions.toml), under the same names,
+# so keyboard/build.gradle.kts builds here unchanged. Move them when droidtop moves them.
+[versions]
+agp = "8.13.1"
+kotlin = "2.2.21"
+appcompat = "1.7.1"
+autofill = "1.3.0"
+core = "1.17.0"
+junit = "4.13.2"
+robolectric = "4.16"
+
+[libraries]
+androidx-appcompat = { module = "androidx.appcompat:appcompat", version.ref = "appcompat" }
+androidx-autofill = { module = "androidx.autofill:autofill", version.ref = "autofill" }
+androidx-core-ktx = { module = "androidx.core:core-ktx", version.ref = "core" }
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+robolectric = { module = "org.robolectric:robolectric", version.ref = "robolectric" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+android-library = { id = "com.android.library", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
